@@ -1,0 +1,8 @@
+.env
+ali.db
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+.tmp/
