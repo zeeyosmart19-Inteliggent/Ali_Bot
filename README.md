@@ -19,6 +19,8 @@ Needs a GPU/Apple Silicon to be fast. Plain Railway/Render CPU builds skip it (i
 Env: `IMAGE_LOCAL=off` to disable, `IMAGE_LOCAL_MODEL`, `IMAGE_LOCAL_SIZE`, `IMAGE_LOCAL_STEPS`.
 
 ## Run
+Local (recommended for on-device images): `./start.sh` — only one copy of the bot may run per token, so stop any cloud deployment first.
+
 ```
 cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN and GEMINI_API_KEY
 pip install -r requirements.txt
