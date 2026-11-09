@@ -11,7 +11,6 @@ import sqlite3
 import uuid
 from urllib.parse import quote
 from types import SimpleNamespace
-from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -49,9 +48,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("ali_ai")
 
-BASE_DIR = Path(__file__).resolve().parent
-LOGO_GIF = BASE_DIR / "assets" / "logo_spin.gif"
-LOGO_PNG = BASE_DIR / "assets" / "logo.png"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -94,7 +90,6 @@ SYSTEM_PROMPT = (
 )
 
 locks: dict[int, asyncio.Lock] = {}
-_logo_file_id: str | None = None  # cached Telegram file_id so the GIF uploads once
 
 # ---------- Database ----------
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -493,24 +488,7 @@ async def edit_screen(query, text: str, markup: InlineKeyboardMarkup | None = No
 
 # ---------- Commands ----------
 async def send_welcome(update: Update) -> None:
-    """Logo animation + welcome caption. File is uploaded once, then reused by file_id."""
-    global _logo_file_id
-    msg = update.effective_message
-    try:
-        if _logo_file_id or LOGO_GIF.exists():
-            sent = await msg.reply_animation(
-                animation=_logo_file_id or LOGO_GIF.read_bytes(),
-                caption=WELCOME,
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard(),
-            )
-            if not _logo_file_id and sent.animation:
-                _logo_file_id = sent.animation.file_id
-            return
-    except Exception:
-        log.exception("Could not send logo animation; falling back to text")
-        _logo_file_id = None
-    await msg.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+    await update.effective_message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -543,10 +521,7 @@ async def about_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Creator: ZEEYO\n"
         "• Skills: text, vision, voice, documents, image generation"
     )
-    if LOGO_PNG.exists():
-        await update.effective_message.reply_photo(LOGO_PNG.read_bytes(), caption=caption, parse_mode=ParseMode.HTML)
-    else:
-        await update.effective_message.reply_text(caption, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(caption, parse_mode=ParseMode.HTML)
 
 
 async def image_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
