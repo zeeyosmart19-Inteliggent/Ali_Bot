@@ -1,7 +1,7 @@
 # ✦ ALI AI
 
 Multimodal Telegram assistant by ZEEYO — streaming text answers, image/GIF vision, voice notes,
-PDF/text summaries and image generation (Imagen 3).
+PDF/text summaries and image generation.
 
 - **Animated responses**: a rotating spark spinner with changing status phrases while thinking, then
   the answer streams in live with a cursor and is re-rendered as formatted Telegram HTML.

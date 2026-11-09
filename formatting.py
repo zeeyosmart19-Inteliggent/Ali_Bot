@@ -1,4 +1,4 @@
-"""Markdown (as produced by Gemini) -> Telegram-safe HTML, plus message chunking."""
+"""Markdown (as produced by the model) -> Telegram-safe HTML, plus message chunking."""
 import html
 import re
 

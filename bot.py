@@ -5,12 +5,15 @@ import asyncio
 import html
 import logging
 import os
+import random
 import re
 import sqlite3
 import uuid
+from urllib.parse import quote
 from types import SimpleNamespace
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -212,18 +215,15 @@ def lang_instruction(uid: int) -> str:
 
 
 def friendly_error(err: Exception | None) -> str:
-    s = str(err or "Unknown error")
-    low = s.lower()
-    if "429" in s or "resource_exhausted" in low or "quota" in low:
-        return (
-            "⚠️ <b>API quota reached.</b>\nThe Gemini free-tier limit was hit. "
-            "Try again later or use a different API key."
-        )
+    """User-facing error text. Never exposes provider names or raw error strings (those go to the log)."""
+    low = str(err or "").lower()
+    if "429" in low or "resource_exhausted" in low or "quota" in low:
+        return "⚠️ <b>I'm a bit overloaded right now.</b> Please try again in a minute."
     if isinstance(err, TimeoutError) or "timed out" in low or "timeout" in low:
         return "⚠️ <b>That took too long.</b> Please try again."
     if "safety" in low or "blocked" in low:
         return "⚠️ I can't help with that request."
-    return f"⚠️ <b>AI service error.</b>\n<code>{html.escape(s[:300])}</code>"
+    return "⚠️ <b>Something went wrong.</b> Please try again."
 
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
@@ -336,35 +336,85 @@ async def respond(
             pass
 
 
+IMAGE_MODELS = ["gemini-2.5-flash-image", "gemini-3.1-flash-image"]
+FALLBACK_IMAGE_MODELS = ["flux", "turbo"]
+IMAGE_FALLBACK = os.getenv("IMAGE_FALLBACK", "on").lower() != "off"
+_primary_image_blocked_until = 0.0  # after a quota error, skip the primary provider for a while
+
+
+async def _image_primary(prompt: str) -> bytes | None:
+    global _primary_image_blocked_until
+    loop = asyncio.get_running_loop()
+    if not client or loop.time() < _primary_image_blocked_until:
+        return None
+    for model in IMAGE_MODELS:
+        try:
+            async with asyncio.timeout(40):
+                r = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+                )
+            for part in (r.candidates[0].content.parts if r and r.candidates else []) or []:
+                if part.inline_data and part.inline_data.data:
+                    return part.inline_data.data
+        except Exception as e:  # noqa: BLE001
+            log.warning("Primary image model %s failed: %s", model, str(e)[:160])
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                _primary_image_blocked_until = loop.time() + 600
+                return None
+    return None
+
+
+_fallback_lock = asyncio.Lock()  # the free service allows ~1 image / 45s per IP, so queue instead of failing
+
+
+async def _image_fallback(prompt: str) -> bytes | None:
+    if not IMAGE_FALLBACK:
+        return None
+    async with _fallback_lock, httpx.AsyncClient(timeout=45, follow_redirects=True) as http:
+        for attempt in range(2):
+            wait = 0
+            for model in FALLBACK_IMAGE_MODELS:
+                try:
+                    r = await http.get(
+                        "https://image.pollinations.ai/prompt/" + quote(prompt[:500], safe=""),
+                        params={"width": 1024, "height": 1024, "model": model, "nologo": "true",
+                                "seed": random.randint(1, 10**6)},
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Fallback image model %s failed: %s", model, e)
+                    continue
+                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/") and len(r.content) > 2000:
+                    return r.content
+                log.warning("Fallback image model %s returned %s", model, r.status_code)
+                if r.status_code == 402:  # free-tier rate limit: "Retry after 34s"
+                    m = re.search(r"[Rr]etry after (\d+)s", r.text)
+                    wait = int(m.group(1)) + 1 if m else 45
+                    break
+            if not wait or attempt:
+                break
+            await asyncio.sleep(min(wait, 50))
+    return None
+
+
 async def handle_image_generation(prompt: str, status_msg, update: Update) -> None:
-    if not client:
-        await safe_edit(status_msg, "AI client is not initialized.")
-        return
     try:
         async with Thinking(status_msg, animation.IMAGE_PHRASES):
             await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
-            result = await client.aio.models.generate_images(
-                model="imagen-3.0-generate-002",
-                prompt=prompt,
-                config=types.GenerateImagesConfig(
-                    number_of_images=1, output_mime_type="image/jpeg", aspect_ratio="1:1"
-                ),
-            )
-        if result and result.generated_images:
+            image = await _image_primary(prompt) or await _image_fallback(prompt)
+        if image:
             await update.effective_message.reply_photo(
-                photo=result.generated_images[0].image.image_bytes,
+                photo=image,
                 caption=f"✦ {html.escape(prompt[:900])}",
                 parse_mode=ParseMode.HTML,
             )
             await status_msg.delete()
         else:
-            await safe_edit(status_msg, "Sorry, I couldn't generate that image. Try a different prompt.")
-    except Exception as e:  # noqa: BLE001
+            await safe_edit(status_msg, "😔 I couldn't create that image right now. Please try again in a moment.")
+    except Exception:  # noqa: BLE001
         log.exception("Image generation error")
-        try:
-            await status_msg.edit_text(friendly_error(e), parse_mode=ParseMode.HTML)
-        except BadRequest:
-            pass
+        await safe_edit(status_msg, "😔 I couldn't create that image right now. Please try again in a moment.")
 
 
 # ---------- Menus ----------
