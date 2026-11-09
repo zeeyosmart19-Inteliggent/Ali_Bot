@@ -37,6 +37,7 @@ from telegram.ext import (
 )
 
 import animation
+import localgen
 from animation import Thinking, safe_edit
 from formatting import chunk_markdown, md_to_html
 
@@ -338,7 +339,8 @@ IMAGE_PROMPT_RULES = (
     "Rewrite the user's request as one detailed English prompt for an image generator. "
     "Keep EVERY subject, count, color, setting, text and style the user asked for exactly; "
     "never add watermarks, logos, captions or signatures. Translate from any language. "
-    "Add concrete visual detail (composition, lighting, quality) only where the user left it open. "
+    "Add a little visual detail (lighting, style) only where the user left it open. "
+    "Maximum 40 words, most important subjects first. "
     "Output ONLY the prompt."
 )
 
@@ -365,23 +367,29 @@ async def _enhance_prompt(prompt: str) -> str:
     return prompt
 
 
+_cloud_image_blocked_until = 0.0  # after a quota failure, skip the cloud models for a few minutes
+
+
 async def _generate_image(prompt: str) -> bytes | None:
-    if not client:
-        return None
-    for model in IMAGE_MODELS:
-        try:
-            async with asyncio.timeout(60):
-                r = await client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
-                )
-            for part in (r.candidates[0].content.parts if r and r.candidates else []) or []:
-                if part.inline_data and part.inline_data.data:
-                    return part.inline_data.data
-        except Exception as e:  # noqa: BLE001 - try the next image model
-            log.warning("Image model %s failed: %s", model, str(e)[:160])
-    return None
+    """Cloud image models first (best quality); on-device model whenever they're unavailable."""
+    global _cloud_image_blocked_until
+    loop = asyncio.get_running_loop()
+    if client and loop.time() >= _cloud_image_blocked_until:
+        for model in IMAGE_MODELS:
+            try:
+                async with asyncio.timeout(60):
+                    r = await client.aio.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+                    )
+                for part in (r.candidates[0].content.parts if r and r.candidates else []) or []:
+                    if part.inline_data and part.inline_data.data:
+                        return part.inline_data.data
+            except Exception as e:  # noqa: BLE001 - try the next image model
+                log.warning("Image model %s failed: %s", model, str(e)[:160])
+        _cloud_image_blocked_until = loop.time() + 300
+    return await localgen.generate(prompt)
 
 
 async def handle_image_generation(prompt: str, status_msg, update: Update) -> None:
@@ -849,6 +857,9 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application) -> None:
+    task = asyncio.create_task(localgen.preload())  # warm the on-device image model in the background
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Main menu"),

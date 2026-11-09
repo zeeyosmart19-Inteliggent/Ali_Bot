@@ -9,6 +9,15 @@ PDF/text summaries and image generation.
   Regenerate with `pip install pillow && python tools/make_logo.py`.
 - **Groups**: replies only when mentioned or replied to.
 
+## Image generation
+`/image` tries Google's cloud image models first. If they're unavailable (free-tier keys have no image quota),
+ALI generates the image **itself on your machine** (no key, no quota, no watermark, ~2-5 s on Apple Silicon):
+```
+pip install -r requirements-local.txt   # torch + diffusers; first run downloads ~2.5 GB model once
+```
+Needs a GPU/Apple Silicon to be fast. Plain Railway/Render CPU builds skip it (it's not in `requirements.txt`).
+Env: `IMAGE_LOCAL=off` to disable, `IMAGE_LOCAL_MODEL`, `IMAGE_LOCAL_SIZE`, `IMAGE_LOCAL_STEPS`.
+
 ## Run
 ```
 cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN and GEMINI_API_KEY

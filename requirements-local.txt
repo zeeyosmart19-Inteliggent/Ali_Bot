@@ -1,0 +1,6 @@
+# Optional: enables on-device image generation (used when cloud image quota is unavailable)
+torch
+diffusers>=0.30
+transformers
+accelerate
+safetensors
