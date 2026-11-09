@@ -5,14 +5,11 @@ import asyncio
 import html
 import logging
 import os
-import random
 import re
 import sqlite3
 import uuid
-from urllib.parse import quote
 from types import SimpleNamespace
 
-import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -331,20 +328,49 @@ async def respond(
             pass
 
 
-IMAGE_MODELS = ["gemini-2.5-flash-image", "gemini-3.1-flash-image"]
-FALLBACK_IMAGE_MODELS = ["flux", "turbo"]
-IMAGE_FALLBACK = os.getenv("IMAGE_FALLBACK", "on").lower() != "off"
-_primary_image_blocked_until = 0.0  # after a quota error, skip the primary provider for a while
+IMAGE_MODELS = [
+    "gemini-2.5-flash-image",
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
+    "gemini-3-pro-image",
+]
+IMAGE_PROMPT_RULES = (
+    "Rewrite the user's request as one detailed English prompt for an image generator. "
+    "Keep EVERY subject, count, color, setting, text and style the user asked for exactly; "
+    "never add watermarks, logos, captions or signatures. Translate from any language. "
+    "Add concrete visual detail (composition, lighting, quality) only where the user left it open. "
+    "Output ONLY the prompt."
+)
 
 
-async def _image_primary(prompt: str) -> bytes | None:
-    global _primary_image_blocked_until
-    loop = asyncio.get_running_loop()
-    if not client or loop.time() < _primary_image_blocked_until:
+async def _enhance_prompt(prompt: str) -> str:
+    """Translate/expand the request so the image model understands it (any language)."""
+    if not client:
+        return prompt
+    for model in MODEL_MAP[DEFAULT_MODEL][:2]:
+        try:
+            async with asyncio.timeout(15):
+                r = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=IMAGE_PROMPT_RULES, max_output_tokens=400, temperature=0.4
+                    ),
+                )
+            text = (r.text or "").strip() if r else ""
+            if text:
+                return text
+        except Exception as e:  # noqa: BLE001
+            log.warning("Prompt enhancement with %s failed: %s", model, str(e)[:120])
+    return prompt
+
+
+async def _generate_image(prompt: str) -> bytes | None:
+    if not client:
         return None
     for model in IMAGE_MODELS:
         try:
-            async with asyncio.timeout(40):
+            async with asyncio.timeout(60):
                 r = await client.aio.models.generate_content(
                     model=model,
                     contents=prompt,
@@ -353,43 +379,8 @@ async def _image_primary(prompt: str) -> bytes | None:
             for part in (r.candidates[0].content.parts if r and r.candidates else []) or []:
                 if part.inline_data and part.inline_data.data:
                     return part.inline_data.data
-        except Exception as e:  # noqa: BLE001
-            log.warning("Primary image model %s failed: %s", model, str(e)[:160])
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                _primary_image_blocked_until = loop.time() + 600
-                return None
-    return None
-
-
-_fallback_lock = asyncio.Lock()  # the free service allows ~1 image / 45s per IP, so queue instead of failing
-
-
-async def _image_fallback(prompt: str) -> bytes | None:
-    if not IMAGE_FALLBACK:
-        return None
-    async with _fallback_lock, httpx.AsyncClient(timeout=45, follow_redirects=True) as http:
-        for attempt in range(2):
-            wait = 0
-            for model in FALLBACK_IMAGE_MODELS:
-                try:
-                    r = await http.get(
-                        "https://image.pollinations.ai/prompt/" + quote(prompt[:500], safe=""),
-                        params={"width": 1024, "height": 1024, "model": model, "nologo": "true",
-                                "seed": random.randint(1, 10**6)},
-                    )
-                except Exception as e:  # noqa: BLE001
-                    log.warning("Fallback image model %s failed: %s", model, e)
-                    continue
-                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/") and len(r.content) > 2000:
-                    return r.content
-                log.warning("Fallback image model %s returned %s", model, r.status_code)
-                if r.status_code == 402:  # free-tier rate limit: "Retry after 34s"
-                    m = re.search(r"[Rr]etry after (\d+)s", r.text)
-                    wait = int(m.group(1)) + 1 if m else 45
-                    break
-            if not wait or attempt:
-                break
-            await asyncio.sleep(min(wait, 50))
+        except Exception as e:  # noqa: BLE001 - try the next image model
+            log.warning("Image model %s failed: %s", model, str(e)[:160])
     return None
 
 
@@ -397,7 +388,7 @@ async def handle_image_generation(prompt: str, status_msg, update: Update) -> No
     try:
         async with Thinking(status_msg, animation.IMAGE_PHRASES):
             await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
-            image = await _image_primary(prompt) or await _image_fallback(prompt)
+            image = await _generate_image(await _enhance_prompt(prompt))
         if image:
             await update.effective_message.reply_photo(
                 photo=image,
