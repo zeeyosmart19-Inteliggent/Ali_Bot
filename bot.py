@@ -1,4 +1,4 @@
-"""ALI AI - Lightning-Fast AI Assistant with Atomic Logo Animation & Deliberate Typing.
+"""ALI AI - Ultimate Multimodal AI Assistant with Image Generation (Imagen 3), Vision, Audio, & Text.
 Created by ZEEYO.
 """
 import asyncio
@@ -7,6 +7,7 @@ import os
 import sqlite3
 
 from google import genai
+from google.genai import types
 from google.genai.errors import ClientError
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -55,7 +56,7 @@ if GEMINI_API_KEY:
         log.exception("Failed to initialize AI client")
 
 SYSTEM_PROMPT = (
-    "You are ALI AI, a powerful, highly intelligent, and futuristic AI assistant created by ZEEYO. "
+    "You are ALI AI, a powerful, highly intelligent, and futuristic multimodal AI assistant created by ZEEYO. "
     "You operate inside Telegram. Answer clearly, accurately, and concisely. "
     "When writing code, use clean fenced code blocks. Be honest when unsure instead of guessing."
 )
@@ -185,7 +186,6 @@ async def handle_text_response(uid: int, user_text: str, status_msg: Update, upd
         "temperature": 0.7,
     }
     
-    # Atomic-inspired rotating logo emblem frames
     atomic_frames = [
         "[ ALI AI ] ➔ Rotating Atomic Orbital Rings...",
         "[ ALI AI ] ➔ Pulsing Cyan & Purple Core...",
@@ -270,6 +270,90 @@ async def handle_text_response(uid: int, user_text: str, status_msg: Update, upd
             await update.message.reply_text(msg)
 
 
+async def handle_multimodal_response(uid: int, contents, status_msg: Update, update: Update, stored_query: str) -> None:
+    if not client:
+        await status_msg.edit_text("AI client is not initialized.")
+        return
+        
+    user_model_choice = get_user_model(uid)
+    candidate_models = MODEL_MAP.get(user_model_choice, ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite"])
+    
+    lang = get_user_lang(uid)
+    lang_instruction = f" Respond in {'Uzbek' if lang == 'uz' else 'English'}."
+    
+    config = {
+        "system_instruction": SYSTEM_PROMPT + lang_instruction,
+        "max_output_tokens": MAX_TOKENS,
+        "temperature": 0.7,
+    }
+    
+    success = False
+    last_error = None
+    final_text = ""
+    
+    for model_name in candidate_models:
+        try:
+            log.info("Attempting multimodal generation with model: %s", model_name)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                ),
+                timeout=30.0
+            )
+            final_text = response.text.strip() if response and response.text else ""
+            if final_text:
+                success = True
+                break
+        except Exception as e:
+            log.warning("Multimodal model %s failed: %s. Trying fallback...", model_name, e)
+            last_error = e
+            continue
+            
+    if success and final_text:
+        save_turn(uid, stored_query, final_text)
+        formatted_final = f"[ ALI AI ]\n━━━━━━━━━━━━━━\n{final_text}"
+        try:
+            await status_msg.edit_text(formatted_final[:4000])
+        except Exception:
+            await update.message.reply_text(formatted_final[:4000])
+            
+        for i in range(4000, len(formatted_final), 4000):
+            await update.message.reply_text(formatted_final[i : i + 4000])
+    else:
+        await status_msg.edit_text("Sorry, I couldn't process that media. Please try again.")
+
+
+async def handle_image_generation(prompt: str, status_msg: Update, update: Update) -> None:
+    if not client:
+        await status_msg.edit_text("AI client is not initialized.")
+        return
+        
+    try:
+        await status_msg.edit_text("[ ALI AI ] ➔ Generating AI Image with Imagen 3...")
+        result = await asyncio.to_thread(
+            client.models.generate_images,
+            model='imagen-3.0-generate-002',
+            prompt=prompt,
+            config=dict(
+                number_of_images=1,
+                output_mime_type="image/jpeg",
+                aspect_ratio="1:1",
+            )
+        )
+        if result and result.generated_images:
+            image_bytes = result.generated_images[0].image.image_bytes
+            await update.message.reply_photo(photo=image_bytes, caption=f"[ ALI AI ] Generated: {prompt}")
+            await status_msg.delete()
+        else:
+            await status_msg.edit_text("Sorry, I couldn't generate that image. Please try another prompt.")
+    except Exception as e:
+        log.exception("Image generation error: %s", e)
+        await status_msg.edit_text(f"⚠️ Image Generation Error: {e}")
+
+
 # ---------- Commands ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
@@ -277,7 +361,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [
-            InlineKeyboardButton("Settings", callback_data="settings"),
+            InlineKeyboardButton("Generate Image", callback_data="feature_image_gen"),
             InlineKeyboardButton("Change Model", callback_data="model_menu"),
         ],
         [
@@ -288,14 +372,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     welcome_text = (
-        "[ ALI AI — Atomic Core Assistant ]\n"
+        "[ ALI AI — Ultimate Multimodal Assistant ]\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "CREATED BY ZEEYO\n\n"
-        "Welcome. Featuring an atomic-inspired rotating core animation and deliberate typewriter text generation.\n\n"
-        "• Atomic Core Logo Animation\n"
-        "• Deliberate Slow Typewriter Effect\n"
-        "• Auto-Detects Any Language\n\n"
-        "Type any message to start chatting."
+        "Welcome! I analyze images/GIFs, read documents, listen to voice notes, and generate AI images (Imagen 3).\n\n"
+        "• Send any photo or GIF to analyze it\n"
+        "• Send a voice note to talk to me\n"
+        "• Use /image <prompt> to generate AI images\n"
+        "• Type any message for instant answers."
     )
     await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
@@ -307,14 +391,12 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "[ ALI AI — User Guide ]\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "• /start - Main menu\n"
-        "• /help - Help instructions\n"
-        "• /about - About creator (ZEEYO)\n"
+        "• /image <prompt> - Generate AI images (Imagen 3)\n"
         "• /settings - View configuration\n"
         "• /model - Switch model\n"
         "• /language - Switch language\n"
-        "• /history - Usage statistics\n"
         "• /clear - Wipe chat memory\n\n"
-        "Type any question to experience atomic core animations and slow typewriter text."
+        "Send photos, GIFs, voice messages, or text anytime!"
     )
     await update.message.reply_text(help_text)
 
@@ -327,10 +409,21 @@ async def about_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "• Bot Name: ALI AI\n"
         "• Creator: ZEEYO\n"
-        "• Storage: Secure Local SQLite History\n\n"
-        "Designed with atomic-inspired geometric vector aesthetics and deliberate typewriter text generation."
+        "• Capabilities: Text, Vision, Voice, Documents, Image Generation (Imagen 3)."
     )
     await update.message.reply_text(about_text)
+
+
+async def image_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    prompt = " ".join(ctx.args) if ctx.args else ""
+    if not prompt:
+        await update.message.reply_text("Usage: /image <prompt> (e.g., /image a futuristic cyberpunk city)")
+        return
+        
+    status_msg = await update.message.reply_text("[ ALI AI ] ➔ Initializing Image Generator...")
+    await handle_image_generation(prompt, status_msg, update)
 
 
 async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -428,7 +521,12 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     data = query.data
-    if data == "settings":
+    if data == "feature_image_gen":
+        await query.message.reply_text(
+            "🎨 *AI Image Generation (Imagen 3)*\n\nType `/image <your prompt>` to generate stunning AI images instantly!",
+            parse_mode="Markdown"
+        )
+    elif data == "settings":
         model = get_user_model(uid)
         lang = get_user_lang(uid)
         await query.message.reply_text(
@@ -472,7 +570,7 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "main_menu":
         keyboard = [
             [
-                InlineKeyboardButton("Settings", callback_data="settings"),
+                InlineKeyboardButton("Generate Image", callback_data="feature_image_gen"),
                 InlineKeyboardButton("Change Model", callback_data="model_menu"),
             ],
             [
@@ -481,12 +579,12 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ],
         ]
         await query.edit_message_text(
-            "[ ALI AI — Atomic Core Assistant ]\nCREATED BY ZEEYO\n\nChoose an option:",
+            "[ ALI AI — Ultimate Multimodal Assistant ]\nCREATED BY ZEEYO\n\nChoose an option:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
 
-# ---------- Message Handler (Text) ----------
+# ---------- Message Handlers (Text, Image/GIF, Voice, Document) ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
@@ -505,6 +603,129 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text("[ ALI AI ] ➔ Initializing Atomic Core...")
         
         await handle_text_response(uid, user_text, status_msg, update)
+
+
+async def on_image_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    uid = update.effective_user.id
+    
+    lock = locks.setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        await update.message.reply_text("One moment, I'm still processing your previous message.")
+        return
+
+    async with lock:
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        status_msg = await update.message.reply_text("[ ALI AI ] ➔ Analyzing Image / GIF...")
+        
+        try:
+            msg = update.message
+            file_obj = None
+            mime_type = "image/jpeg"
+            
+            if msg.photo:
+                file_obj = await msg.photo[-1].get_file()
+                mime_type = "image/jpeg"
+            elif msg.animation:
+                file_obj = await msg.animation.get_file()
+                mime_type = msg.animation.mime_type or "image/gif"
+            elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/"):
+                file_obj = await msg.document.get_file()
+                mime_type = msg.document.mime_type
+            elif msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(ext) for ext in [".gif", ".png", ".jpg", ".jpeg", ".webp"]):
+                file_obj = await msg.document.get_file()
+                name = msg.document.file_name.lower()
+                if name.endswith(".gif"):
+                    mime_type = "image/gif"
+                elif name.endswith(".png"):
+                    mime_type = "image/png"
+                elif name.endswith(".webp"):
+                    mime_type = "image/webp"
+                else:
+                    mime_type = "image/jpeg"
+            else:
+                await status_msg.edit_text("Please send a valid image or GIF.")
+                return
+                
+            media_bytes = bytes(await file_obj.download_as_bytearray())
+            caption = msg.caption or "Describe this image or animated GIF in detail and answer any questions."
+            
+            media_part = types.Part.from_bytes(data=media_bytes, mime_type=mime_type)
+            contents = [media_part, caption]
+            
+            await handle_multimodal_response(uid, contents, status_msg, update, f"[Image/GIF sent] {caption}")
+        except Exception:
+            log.exception("Error in image/GIF handler")
+            await status_msg.edit_text("Sorry, I couldn't process that image or GIF. Please try again.")
+
+
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    uid = update.effective_user.id
+    
+    lock = locks.setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        await update.message.reply_text("One moment, I'm still processing your previous message.")
+        return
+
+    async with lock:
+        await update.effective_chat.send_action(ChatAction.RECORD_VOICE)
+        status_msg = await update.message.reply_text("[ ALI AI ] ➔ Listening to Voice Note...")
+        
+        try:
+            voice_file = await update.message.voice.get_file()
+            voice_bytes = bytes(await voice_file.download_as_bytearray())
+            
+            audio_part = types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg")
+            contents = [audio_part, "Please listen to this voice message, transcribe or understand what was said, and respond helpfully."]
+            
+            await handle_multimodal_response(uid, contents, status_msg, update, "[Voice message sent]")
+        except Exception:
+            log.exception("Error in voice handler")
+            await status_msg.edit_text("Sorry, I couldn't process that voice message. Please try again.")
+
+
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    uid = update.effective_user.id
+    doc = update.message.document
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("That file is too large (20 MB max).")
+        return
+
+    lock = locks.setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        await update.message.reply_text("One moment, I'm still processing your previous message.")
+        return
+
+    async with lock:
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        status_msg = await update.message.reply_text("[ ALI AI ] ➔ Analyzing Document...")
+        
+        try:
+            file_obj = await doc.get_file()
+            raw = bytes(await file_obj.download_as_bytearray())
+            caption = update.message.caption or "Summarize this document and extract key points."
+            name = (doc.file_name or "file").lower()
+            
+            if doc.mime_type == "application/pdf" or name.endswith(".pdf"):
+                doc_part = types.Part.from_bytes(data=raw, mime_type="application/pdf")
+                contents = [doc_part, caption]
+            else:
+                try:
+                    file_text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    await status_msg.edit_text("I can read PDFs and UTF-8 text/code files only.")
+                    return
+                contents = f"Document '{doc.file_name}':\n\n{file_text[:100_000]}\n\n{caption}"
+                
+            await handle_multimodal_response(uid, contents, status_msg, update, f"[Document sent: {doc.file_name}] {caption}")
+        except Exception:
+            log.exception("Error in document handler")
+            await status_msg.edit_text("Sorry, I couldn't process that document. Please try again.")
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -529,11 +750,15 @@ def main() -> None:
     app.add_handler(CommandHandler("language", language_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("image", image_cmd))
     app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.Document.IMAGE, on_image_media))
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.IMAGE, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
 
-    log.info("ALI AI (created by ZEEYO) is running with professional atomic branding & slow typewriter speed...")
+    log.info("ALI AI (created by ZEEYO) is running as ultimate multimodal assistant with Imagen 3...")
     app.run_polling()
 
 
