@@ -57,8 +57,9 @@ async def safe_edit(msg, text: str, **kwargs) -> bool:
 class Thinking:
     """Async context manager: animates `msg` until stopped / first token arrives."""
 
-    def __init__(self, msg, phrases: list[str] | None = None):
+    def __init__(self, msg, phrases: list[str] | None = None, header: str = ""):
         self.msg = msg
+        self.header = header
         self.phrases = phrases or THINK_PHRASES
         self._task: asyncio.Task | None = None
 
@@ -66,7 +67,8 @@ class Thinking:
         started = time.monotonic()
         i = 0
         while True:
-            await safe_edit(self.msg, frame_text(i, self.phrases, started))
+            frame = frame_text(i, self.phrases, started)
+            await safe_edit(self.msg, f"{self.header}\n\n{frame}" if self.header else frame)
             i += 1
             await asyncio.sleep(FRAME_INTERVAL)
 

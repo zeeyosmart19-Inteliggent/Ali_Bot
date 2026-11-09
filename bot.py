@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import sqlite3
+import uuid
+from types import SimpleNamespace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,6 +18,8 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     LinkPreviewOptions,
     Update,
 )
@@ -24,8 +28,11 @@ from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
+    ChosenInlineResultHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -222,10 +229,13 @@ def friendly_error(err: Exception | None) -> str:
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
-async def send_final(status_msg, update: Update, text: str) -> None:
+async def send_final(status_msg, update: Update, text: str, header: str = "") -> None:
     """Replace the animated status message with the formatted answer (chunked if long)."""
     for i, chunk in enumerate(chunk_markdown(text)):
         rendered = md_to_html(chunk)
+        if i == 0 and header:
+            rendered = f"<b>{html.escape(header)}</b>\n\n{rendered}"
+            chunk = f"{header}\n\n{chunk}"
         try:
             if i == 0:
                 await status_msg.edit_text(
@@ -254,6 +264,9 @@ async def respond(
     status_msg,
     phrases: list[str] | None = None,
     use_history: bool = True,
+    save: bool = True,
+    header: str = "",
+    extra_system: str = "",
 ) -> None:
     """Animate while thinking, live-stream the answer, then render the final formatted reply."""
     if not client:
@@ -268,12 +281,13 @@ async def respond(
         )
     ]
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT + lang_instruction(uid),
+        system_instruction=SYSTEM_PROMPT + lang_instruction(uid) + extra_system,
         max_output_tokens=MAX_TOKENS,
         temperature=0.7,
     )
 
-    thinking = Thinking(status_msg, phrases)
+    header = header[:200]
+    thinking = Thinking(status_msg, phrases, header)
     thinking.start()
     full_text, last_error = "", None
     try:
@@ -295,7 +309,8 @@ async def respond(
                         full_text += chunk.text
                         now = loop.time()
                         if now - last_edit >= STREAM_EDIT_INTERVAL:
-                            await safe_edit(status_msg, full_text[-STREAM_TAIL:] + CURSOR)
+                            preview = full_text[-STREAM_TAIL:] + CURSOR
+                            await safe_edit(status_msg, f"{header}\n\n{preview}" if header else preview)
                             last_edit = loop.time()
                 if full_text.strip():
                     break
@@ -310,8 +325,9 @@ async def respond(
 
     final = full_text.strip()
     if final:
-        save_turn(uid, stored_query, final)
-        await send_final(status_msg, update, final)
+        if save:
+            save_turn(uid, stored_query, final)
+        await send_final(status_msg, update, final, header)
     else:
         log.error("All models failed. Last error: %s", last_error)
         try:
@@ -527,6 +543,9 @@ async def language_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- Inline callbacks ----------
 async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if (query.data or "").startswith("inl:"):
+        await inline_button(update, ctx)
+        return
     await query.answer()
     uid = query.from_user.id
     if ALLOWED and uid not in ALLOWED:
@@ -679,6 +698,136 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await safe_edit(status, "Sorry, I couldn't process that document. Please try again.")
 
 
+# ---------- Anywhere access: inline mode, channels, new groups ----------
+class InlineTarget:
+    """Adapter so respond() can animate/edit an inline-mode message (no chat id, only inline_message_id)."""
+
+    def __init__(self, bot, inline_message_id: str):
+        self.bot, self.inline_message_id = bot, inline_message_id
+
+    async def edit_text(self, text: str, **kwargs):
+        return await self.bot.edit_message_text(text, inline_message_id=self.inline_message_id, **kwargs)
+
+    async def reply_text(self, *args, **kwargs):  # inline messages can't spill into follow-ups
+        log.info("Inline answer overflow dropped")
+
+
+pending_inline: dict[str, tuple[int, str]] = {}  # result_id -> (user_id, question)
+background_tasks: set[asyncio.Task] = set()
+INLINE_SYSTEM = " Keep the answer under 2500 characters; it will be posted inside someone else's chat."
+
+
+def launch_inline(bot, rid: str, inline_message_id: str, uid: int, question: str) -> None:
+    async def run():
+        target = InlineTarget(bot, inline_message_id)
+        async with locks.setdefault(uid, asyncio.Lock()):
+            await respond(
+                SimpleNamespace(effective_message=target), uid, [question], question, target,
+                use_history=False, save=False, header=f"❓ {question}", extra_system=INLINE_SYSTEM,
+            )
+
+    task = asyncio.create_task(run())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+async def on_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`@bot your question` typed in ANY chat (even ones the bot isn't in)."""
+    iq = update.inline_query
+    uid = iq.from_user.id
+    if ALLOWED and uid not in ALLOWED:
+        await iq.answer([], cache_time=5, is_personal=True)
+        return
+    q = iq.query.strip()
+    uname = ctx.bot.username
+    if not q:
+        result = InlineQueryResultArticle(
+            id="hint",
+            title="✦ ALI AI",
+            description="Type your question after my username…",
+            input_message_content=InputTextMessageContent(
+                f"✦ <b>ALI AI</b> — type <code>@{uname}</code> followed by your question, in any chat.",
+                parse_mode=ParseMode.HTML,
+            ),
+        )
+        await iq.answer([result], cache_time=0, is_personal=True)
+        return
+
+    q = q[:500]
+    rid = uuid.uuid4().hex
+    pending_inline[rid] = (uid, q)
+    while len(pending_inline) > 500:  # unchosen suggestions pile up; drop the oldest
+        pending_inline.pop(next(iter(pending_inline)))
+    result = InlineQueryResultArticle(
+        id=rid,
+        title="✦ Ask ALI AI",
+        description=q,
+        input_message_content=InputTextMessageContent(
+            f"❓ {html.escape(q)}\n\n✦ <i>Thinking…</i>", parse_mode=ParseMode.HTML
+        ),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✦ Get answer", callback_data=f"inl:{rid}")]]),
+    )
+    await iq.answer([result], cache_time=0, is_personal=True)
+
+
+async def on_chosen_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fires when the user sends the inline result (needs /setinlinefeedback enabled in BotFather)."""
+    r = update.chosen_inline_result
+    info = pending_inline.pop(r.result_id, None)
+    if info and r.inline_message_id:
+        launch_inline(ctx.bot, r.result_id, r.inline_message_id, info[0], info[1])
+
+
+async def inline_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fallback trigger: tapping 'Get answer' works even if inline feedback isn't enabled."""
+    query = update.callback_query
+    rid = query.data.split(":", 1)[1]
+    info = pending_inline.get(rid)
+    if not info or not query.inline_message_id:
+        await query.answer("Already answering, or this request expired.")
+        return
+    if info[0] != query.from_user.id:
+        await query.answer("Only the person who asked can start this answer.", show_alert=True)
+        return
+    pending_inline.pop(rid, None)
+    await query.answer("Thinking…")
+    launch_inline(ctx.bot, rid, query.inline_message_id, info[0], info[1])
+
+
+async def on_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Answer when a channel post mentions the bot (bot must be a channel admin; only admins can post)."""
+    msg = update.channel_post
+    text = msg.text or msg.caption or ""
+    uname = (ctx.bot.username or "").lower()
+    if not uname or f"@{uname}" not in text.lower():
+        return
+    question = strip_mention(text, ctx)
+    if not question:
+        return
+    lock = locks.setdefault(msg.chat.id, asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        status = await msg.reply_text(f"{animation.SPINNER[0]} Thinking.")
+        await respond(update, msg.chat.id, [question], question, status, use_history=False, save=False)
+
+
+async def on_added_to_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Introduce ALI when it is added to a group."""
+    change = update.my_chat_member
+    if change.chat.type not in ("group", "supergroup"):
+        return
+    was_in = change.old_chat_member.status in ("member", "administrator", "creator")
+    now_in = change.new_chat_member.status in ("member", "administrator")
+    if now_in and not was_in:
+        await ctx.bot.send_message(
+            change.chat.id,
+            f"✦ <b>ALI AI</b> is here!\n\nMention me — <code>@{ctx.bot.username} your question</code> — "
+            "or reply to one of my messages. I can also read photos, voice notes and documents.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error in application", exc_info=ctx.error)
 
@@ -707,6 +856,11 @@ def main() -> None:
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    # must be registered first: channel posts have no user, so the handlers below would swallow them
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & (filters.TEXT | filters.CAPTION), on_channel_post))
+    app.add_handler(InlineQueryHandler(on_inline_query))
+    app.add_handler(ChosenInlineResultHandler(on_chosen_inline))
+    app.add_handler(ChatMemberHandler(on_added_to_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     for name, fn in (
         ("start", start), ("help", help_cmd), ("about", about_cmd), ("settings", settings_cmd),
         ("model", model_cmd), ("language", language_cmd), ("history", settings_cmd),
@@ -717,11 +871,11 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.Document.IMAGE, on_image_media))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.IMAGE, on_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
 
     log.info("ALI AI (created by ZEEYO) is running...")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
